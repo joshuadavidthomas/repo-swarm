@@ -2,18 +2,63 @@
 Claude API integration for the Claude Investigator.
 """
 
-from anthropic import Anthropic
+import os
 from typing import Optional
 from .config import Config
 
 
 class ClaudeAnalyzer:
     """Handles Claude API interactions for analysis."""
-    
+
+    # Model mapping from standard Claude model names to Bedrock model IDs
+    BEDROCK_MODEL_MAPPING = {
+        "claude-opus-4-6-20260120": "us.anthropic.claude-opus-4-6-v1",
+        "claude-opus-4-5-20251101": "us.anthropic.claude-opus-4-5-20251101-v1:0",
+        "claude-opus-4-1-20250805": "us.anthropic.claude-opus-4-1-20250805-v1:0",
+        "claude-sonnet-4-6-20260120": "us.anthropic.claude-sonnet-4-6-20260120-v1:0",
+        "claude-sonnet-4-5-20250929": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "claude-sonnet-4-20250514": "us.anthropic.claude-sonnet-4-20250514-v1:0",
+        "claude-haiku-4-5-20251001": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "claude-opus-4-20250514": "us.anthropic.claude-opus-4-20250514-v1:0",
+    }
+
     def __init__(self, api_key: str, logger):
-        self.client = Anthropic(api_key=api_key)
         self.logger = logger
+        self.use_bedrock = os.getenv('CLAUDE_PROVIDER') == 'bedrock'
+
+        if self.use_bedrock:
+            from anthropic import AnthropicBedrock
+            aws_region = os.getenv('AWS_DEFAULT_REGION', 'us-east-1')
+            self.client = AnthropicBedrock(aws_region=aws_region)
+            self.logger.info(f"Using Bedrock provider in region {aws_region}")
+        else:
+            from anthropic import Anthropic
+            self.client = Anthropic(api_key=api_key)
+            self.logger.info("Using standard Anthropic API")
     
+    def _get_model_id(self, model_name: str) -> str:
+        """
+        Get the appropriate model ID for the current provider.
+
+        For Bedrock, converts standard Claude model names to Bedrock model IDs.
+        For standard API, returns the model name as-is.
+
+        Args:
+            model_name: Standard Claude model name
+
+        Returns:
+            Model ID appropriate for the current provider
+        """
+        if self.use_bedrock:
+            bedrock_model = self.BEDROCK_MODEL_MAPPING.get(model_name)
+            if bedrock_model:
+                self.logger.debug(f"Mapped {model_name} to Bedrock model {bedrock_model}")
+                return bedrock_model
+            else:
+                self.logger.warning(f"No Bedrock mapping for {model_name}, using as-is")
+                return model_name
+        return model_name
+
     def clean_prompt(self, prompt_template: str) -> str:
         """
         Clean the prompt template by removing version lines and other metadata.
@@ -85,12 +130,15 @@ class ClaudeAnalyzer:
             # Use config overrides or defaults
             claude_model = config_overrides.get("claude_model") or Config.CLAUDE_MODEL
             max_tokens = config_overrides.get("max_tokens") or Config.MAX_TOKENS
-            
+
+            # Get the appropriate model ID for the current provider
+            model_id = self._get_model_id(claude_model)
+
             self.logger.info("Sending analysis request to Claude API")
-            self.logger.debug(f"Using model: {claude_model}, max_tokens: {max_tokens}")
-            
+            self.logger.debug(f"Using model: {model_id}, max_tokens: {max_tokens}")
+
             response = self.client.messages.create(
-                model=claude_model,
+                model=model_id,
                 max_tokens=max_tokens,
                 messages=[{"role": "user", "content": prompt}]
             )

@@ -11,13 +11,81 @@ from .utils import Utils
 
 class GitRepositoryManager:
     """Handles Git repository operations."""
-    
+
     def __init__(self, logger):
         self.logger = logger
         self.github_token = os.getenv('GITHUB_TOKEN')
+        self.codecommit_username = os.getenv('CODECOMMIT_USERNAME')
+        self.codecommit_password = os.getenv('CODECOMMIT_PASSWORD')
+
+        self.gitlab_token = os.getenv('GITLAB_TOKEN')
+        self.bitbucket_username = os.getenv('BITBUCKET_USERNAME')
+        self.bitbucket_app_password = os.getenv('BITBUCKET_APP_PASSWORD')
+        self.azure_devops_pat = os.getenv('AZURE_DEVOPS_PAT')
+
         if self.github_token:
             self.logger.debug("GitHub token found in environment")
+        if self.codecommit_username and self.codecommit_password:
+            self.logger.debug("CodeCommit credentials found in environment")
+        if self.gitlab_token:
+            self.logger.debug("GitLab token found in environment")
+        if self.bitbucket_username and self.bitbucket_app_password:
+            self.logger.debug("Bitbucket credentials found in environment")
+        if self.azure_devops_pat:
+            self.logger.debug("Azure DevOps PAT found in environment")
     
+    def _is_codecommit_url(self, url: str) -> bool:
+        """
+        Check if a URL is a CodeCommit repository URL.
+
+        Args:
+            url: Repository URL to check
+
+        Returns:
+            True if URL is a CodeCommit URL, False otherwise
+        """
+        return 'git-codecommit' in url and 'amazonaws.com' in url
+
+    def _is_gitlab_url(self, url: str) -> bool:
+        """
+        Check if a URL is a GitLab repository URL.
+
+        Args:
+            url: Repository URL to check
+
+        Returns:
+            True if URL is a GitLab URL, False otherwise
+        """
+        parsed = urlparse(url)
+        hostname = parsed.hostname or ''
+        return 'gitlab.com' in url or 'gitlab.' in hostname
+
+    def _is_bitbucket_url(self, url: str) -> bool:
+        """
+        Check if a URL is a Bitbucket repository URL.
+
+        Args:
+            url: Repository URL to check
+
+        Returns:
+            True if URL is a Bitbucket URL, False otherwise
+        """
+        parsed = urlparse(url)
+        hostname = parsed.hostname or ''
+        return 'bitbucket.org' in url or 'bitbucket.' in hostname
+
+    def _is_azure_devops_url(self, url: str) -> bool:
+        """
+        Check if a URL is an Azure DevOps repository URL.
+
+        Args:
+            url: Repository URL to check
+
+        Returns:
+            True if URL is an Azure DevOps URL, False otherwise
+        """
+        return 'dev.azure.com' in url or 'visualstudio.com' in url
+
     def _sanitize_url_for_logging(self, url: str) -> str:
         """
         Remove sensitive information from URLs for safe logging.
@@ -59,6 +127,42 @@ class GitRepositoryManager:
         
         return url
     
+
+    def _strip_credentials_from_remote(self, repo_dir: str) -> None:
+        """
+        Remove embedded credentials from the git remote URL in .git/config.
+        
+        After clone/update, credentials may persist in the remote URL.
+        This strips them to prevent credential leakage via .git/config.
+        """
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["git", "remote", "get-url", "origin"],
+                cwd=repo_dir, capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                return
+            
+            current_url = result.stdout.strip()
+            parsed = urlparse(current_url)
+            
+            if parsed.username or parsed.password:
+                clean_netloc = parsed.hostname or ''
+                if parsed.port:
+                    clean_netloc += f":{parsed.port}"
+                clean_url = urlunparse((
+                    parsed.scheme, clean_netloc, parsed.path,
+                    parsed.params, parsed.query, parsed.fragment
+                ))
+                subprocess.run(
+                    ["git", "remote", "set-url", "origin", clean_url],
+                    cwd=repo_dir, check=True
+                )
+                self.logger.debug("Stripped credentials from git remote URL")
+        except Exception as e:
+            self.logger.debug(f"Could not strip credentials from remote: {e}")
+
     def clone_or_update(self, repo_location: str, target_dir: str) -> str:
         """
         Clone a repository or update it if it already exists.
@@ -74,58 +178,152 @@ class GitRepositoryManager:
         auth_repo_location = self._add_authentication(repo_location)
         
         if self._is_existing_repo(target_dir):
-            return self._update_repository(target_dir, auth_repo_location)
+            result = self._update_repository(target_dir, auth_repo_location)
         else:
-            return self._clone_repository(auth_repo_location, target_dir)
+            result = self._clone_repository(auth_repo_location, target_dir)
+        
+        # Strip credentials from .git/config to prevent leakage
+        self._strip_credentials_from_remote(result)
+        return result
     
     def _add_authentication(self, repo_location: str) -> str:
         """
-        Add GitHub token authentication to repository URL if available.
-        
+        Add authentication to repository URL if available (GitHub or CodeCommit).
+
         Args:
             repo_location: Original repository URL
-            
+
         Returns:
             Repository URL with authentication added if applicable
         """
         # Only process URLs, not local paths
         if not repo_location.startswith(('http://', 'https://')):
             return repo_location
-        
-        # Only add token for GitHub repositories
-        if 'github.com' not in repo_location:
-            return repo_location
-        
-        # If no token available, return original URL
-        if not self.github_token:
-            return repo_location
-        
+
         # Parse the URL
         parsed = urlparse(repo_location)
-        
+
         # If authentication already exists, don't override
         if parsed.username:
             self.logger.debug("Authentication already present in URL, not overriding")
             return repo_location
-        
-        # Add token authentication
-        # GitHub accepts the token as username with no password
-        auth_netloc = f"{self.github_token}@{parsed.hostname}"
-        if parsed.port:
-            auth_netloc += f":{parsed.port}"
-        
-        # Reconstruct the URL with authentication
-        auth_url = urlunparse((
-            parsed.scheme,
-            auth_netloc,
-            parsed.path,
-            parsed.params,
-            parsed.query,
-            parsed.fragment
-        ))
-        
-        self.logger.debug("Added GitHub token authentication to repository URL")
-        return auth_url
+
+        # Handle CodeCommit repositories
+        if self._is_codecommit_url(repo_location):
+            if not self.codecommit_username or not self.codecommit_password:
+                self.logger.warning("CodeCommit URL detected but credentials not available")
+                return repo_location
+
+            # Add CodeCommit HTTPS Git credentials
+            auth_netloc = f"{self.codecommit_username}:{self.codecommit_password}@{parsed.hostname}"
+            if parsed.port:
+                auth_netloc += f":{parsed.port}"
+
+            # Reconstruct the URL with authentication
+            auth_url = urlunparse((
+                parsed.scheme,
+                auth_netloc,
+                parsed.path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment
+            ))
+
+            self.logger.debug("Added CodeCommit HTTPS authentication to repository URL")
+            return auth_url
+
+        # Handle GitHub repositories
+        if 'github.com' in repo_location:
+            if not self.github_token:
+                return repo_location
+
+            # Add token authentication
+            # GitHub accepts the token as username with no password
+            auth_netloc = f"{self.github_token}@{parsed.hostname}"
+            if parsed.port:
+                auth_netloc += f":{parsed.port}"
+
+            # Reconstruct the URL with authentication
+            auth_url = urlunparse((
+                parsed.scheme,
+                auth_netloc,
+                parsed.path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment
+            ))
+
+            self.logger.debug("Added GitHub token authentication to repository URL")
+            return auth_url
+
+        # Handle GitLab repositories
+        if self._is_gitlab_url(repo_location):
+            if not self.gitlab_token:
+                self.logger.warning("GitLab URL detected but token not available")
+                return repo_location
+
+            auth_netloc = f"oauth2:{self.gitlab_token}@{parsed.hostname}"
+            if parsed.port:
+                auth_netloc += f":{parsed.port}"
+
+            auth_url = urlunparse((
+                parsed.scheme,
+                auth_netloc,
+                parsed.path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment
+            ))
+
+            self.logger.debug("Added GitLab token authentication to repository URL")
+            return auth_url
+
+        # Handle Bitbucket repositories
+        if self._is_bitbucket_url(repo_location):
+            if not self.bitbucket_username or not self.bitbucket_app_password:
+                self.logger.warning("Bitbucket URL detected but credentials not available")
+                return repo_location
+
+            auth_netloc = f"{self.bitbucket_username}:{self.bitbucket_app_password}@{parsed.hostname}"
+            if parsed.port:
+                auth_netloc += f":{parsed.port}"
+
+            auth_url = urlunparse((
+                parsed.scheme,
+                auth_netloc,
+                parsed.path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment
+            ))
+
+            self.logger.debug("Added Bitbucket authentication to repository URL")
+            return auth_url
+
+        # Handle Azure DevOps repositories
+        if self._is_azure_devops_url(repo_location):
+            if not self.azure_devops_pat:
+                self.logger.warning("Azure DevOps URL detected but PAT not available")
+                return repo_location
+
+            auth_netloc = f":{self.azure_devops_pat}@{parsed.hostname}"
+            if parsed.port:
+                auth_netloc += f":{parsed.port}"
+
+            auth_url = urlunparse((
+                parsed.scheme,
+                auth_netloc,
+                parsed.path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment
+            ))
+
+            self.logger.debug("Added Azure DevOps PAT authentication to repository URL")
+            return auth_url
+
+        # For other URLs, return as-is
+        return repo_location
     
     def _is_existing_repo(self, repo_dir: str) -> bool:
         """Check if a directory contains a valid Git repository."""
@@ -138,22 +336,35 @@ class GitRepositoryManager:
             import git
             repo = git.Repo(repo_dir)
             self.logger.info("Pulling latest changes from remote repository")
-            
+
             origin = repo.remotes.origin
-            
+
             # Update remote URL with authentication if needed
-            if self.github_token and 'github.com' in auth_repo_location:
-                current_url = origin.url
-                if 'github.com' in current_url and '@' not in current_url:
-                    self.logger.debug("Updating remote URL with authentication")
+            current_url = origin.url
+            if '@' not in current_url:
+                # Check if it's GitHub or CodeCommit
+                if self.github_token and 'github.com' in current_url:
+                    self.logger.debug("Updating remote URL with GitHub authentication")
                     origin.set_url(auth_repo_location)
-            
+                elif self._is_codecommit_url(current_url) and self.codecommit_username:
+                    self.logger.debug("Updating remote URL with CodeCommit authentication")
+                    origin.set_url(auth_repo_location)
+                elif self._is_gitlab_url(current_url) and self.gitlab_token:
+                    self.logger.debug("Updating remote URL with GitLab authentication")
+                    origin.set_url(auth_repo_location)
+                elif self._is_bitbucket_url(current_url) and self.bitbucket_username:
+                    self.logger.debug("Updating remote URL with Bitbucket authentication")
+                    origin.set_url(auth_repo_location)
+                elif self._is_azure_devops_url(current_url) and self.azure_devops_pat:
+                    self.logger.debug("Updating remote URL with Azure DevOps authentication")
+                    origin.set_url(auth_repo_location)
+
             origin.fetch()
             origin.pull()
-            
+
             self.logger.info(f"Repository successfully updated at: {repo_dir}")
             return repo_dir
-            
+
         except Exception as e:
             # Import git to check for GitCommandError
             import git
@@ -350,35 +561,35 @@ class GitRepositoryManager:
     
     def push_with_authentication(self, repo_dir: str, branch: str = "main") -> dict:
         """
-        Push changes to remote repository with proper authentication.
-        
+        Push changes to remote repository with proper authentication (GitHub or CodeCommit).
+
         Args:
             repo_dir: Directory containing the git repository
             branch: Branch to push to (default: main)
-            
+
         Returns:
             Dictionary with push result status and message
         """
         try:
-            # Ensure remote URL has authentication for push
-            if self.github_token:
-                # Get current remote URL
-                result = subprocess.run(
-                    ["git", "remote", "get-url", "origin"],
-                    cwd=repo_dir,
-                    capture_output=True,
-                    text=True
-                )
-                
-                if result.returncode == 0:
-                    current_url = result.stdout.strip()
-                    
-                    # Log current remote URL (sanitized)
-                    safe_url = self._sanitize_url_for_logging(current_url)
-                    self.logger.info(f"Current remote URL: {safe_url}")
-                    
-                    # Add authentication if not already present
-                    if 'github.com' in current_url and '@' not in current_url:
+            # Get current remote URL
+            result = subprocess.run(
+                ["git", "remote", "get-url", "origin"],
+                cwd=repo_dir,
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode == 0:
+                current_url = result.stdout.strip()
+
+                # Log current remote URL (sanitized)
+                safe_url = self._sanitize_url_for_logging(current_url)
+                self.logger.info(f"Current remote URL: {safe_url}")
+
+                # Add authentication if not already present
+                if '@' not in current_url:
+                    # Check if it's GitHub
+                    if 'github.com' in current_url and self.github_token:
                         if current_url.startswith('https://'):
                             auth_url = current_url.replace('https://', f'https://{self.github_token}@')
                             self.logger.info("Updating remote URL with GitHub token for push")
@@ -387,10 +598,50 @@ class GitRepositoryManager:
                                 cwd=repo_dir,
                                 check=True
                             )
+                    # Check if it's CodeCommit
+                    elif self._is_codecommit_url(current_url) and self.codecommit_username and self.codecommit_password:
+                        if current_url.startswith('https://'):
+                            auth_url = current_url.replace('https://', f'https://{self.codecommit_username}:{self.codecommit_password}@')
+                            self.logger.info("Updating remote URL with CodeCommit credentials for push")
+                            subprocess.run(
+                                ["git", "remote", "set-url", "origin", auth_url],
+                                cwd=repo_dir,
+                                check=True
+                            )
+                    # Check if it's GitLab
+                    elif self._is_gitlab_url(current_url) and self.gitlab_token:
+                        if current_url.startswith('https://'):
+                            auth_url = current_url.replace('https://', f'https://oauth2:{self.gitlab_token}@')
+                            self.logger.info("Updating remote URL with GitLab token for push")
+                            subprocess.run(
+                                ["git", "remote", "set-url", "origin", auth_url],
+                                cwd=repo_dir,
+                                check=True
+                            )
+                    # Check if it's Bitbucket
+                    elif self._is_bitbucket_url(current_url) and self.bitbucket_username and self.bitbucket_app_password:
+                        if current_url.startswith('https://'):
+                            auth_url = current_url.replace('https://', f'https://{self.bitbucket_username}:{self.bitbucket_app_password}@')
+                            self.logger.info("Updating remote URL with Bitbucket credentials for push")
+                            subprocess.run(
+                                ["git", "remote", "set-url", "origin", auth_url],
+                                cwd=repo_dir,
+                                check=True
+                            )
+                    # Check if it's Azure DevOps
+                    elif self._is_azure_devops_url(current_url) and self.azure_devops_pat:
+                        if current_url.startswith('https://'):
+                            auth_url = current_url.replace('https://', f'https://:{self.azure_devops_pat}@')
+                            self.logger.info("Updating remote URL with Azure DevOps PAT for push")
+                            subprocess.run(
+                                ["git", "remote", "set-url", "origin", auth_url],
+                                cwd=repo_dir,
+                                check=True
+                            )
                     else:
-                        self.logger.info("Remote URL already has authentication or is not a GitHub HTTPS URL")
-            else:
-                self.logger.warning("No GitHub token available - push may fail for private repositories")
+                        self.logger.warning("No credentials available for this repository type")
+                else:
+                    self.logger.info("Remote URL already has authentication")
             
             # Perform the push
             push_result = subprocess.run(
@@ -595,6 +846,298 @@ class GitRepositoryManager:
                 "error": str(e)
             }
     
+    def list_codecommit_repositories(self, region: str = None) -> dict:
+        """
+        List all CodeCommit repositories in the specified AWS region.
+
+        Args:
+            region: AWS region (defaults to AWS_DEFAULT_REGION env var or us-east-1)
+
+        Returns:
+            Dictionary with status and list of repositories
+        """
+        try:
+            import boto3
+
+            # Determine region
+            aws_region = region or os.getenv('AWS_DEFAULT_REGION', 'us-east-1')
+
+            self.logger.info(f"Listing CodeCommit repositories in region {aws_region}")
+
+            # Create CodeCommit client
+            codecommit = boto3.client('codecommit', region_name=aws_region)
+
+            # List repositories
+            response = codecommit.list_repositories()
+
+            repositories = []
+            for repo_metadata in response.get('repositories', []):
+                repo_name = repo_metadata['repositoryName']
+
+                # Get detailed repository info
+                try:
+                    repo_detail = codecommit.get_repository(repositoryName=repo_name)
+                    repo_info = repo_detail['repositoryMetadata']
+
+                    repositories.append({
+                        'name': repo_name,
+                        'clone_url_http': repo_info['cloneUrlHttp'],
+                        'clone_url_ssh': repo_info.get('cloneUrlSsh', ''),
+                        'arn': repo_info.get('Arn', ''),
+                        'description': repo_info.get('repositoryDescription', ''),
+                        'created_date': repo_info.get('creationDate', ''),
+                        'last_modified_date': repo_info.get('lastModifiedDate', '')
+                    })
+                except Exception as e:
+                    self.logger.warning(f"Could not get details for repository {repo_name}: {str(e)}")
+                    # Add basic info even if details fail
+                    repositories.append({
+                        'name': repo_name,
+                        'clone_url_http': f"https://git-codecommit.{aws_region}.amazonaws.com/v1/repos/{repo_name}",
+                        'error': str(e)
+                    })
+
+            self.logger.info(f"Found {len(repositories)} CodeCommit repositories")
+
+            return {
+                "status": "success",
+                "region": aws_region,
+                "count": len(repositories),
+                "repositories": repositories
+            }
+
+        except Exception as e:
+            self.logger.error(f"Failed to list CodeCommit repositories: {str(e)}")
+            return {
+                "status": "error",
+                "message": f"Failed to list CodeCommit repositories: {str(e)}",
+                "error": str(e)
+            }
+
+    def list_gitlab_repositories(self, token: str = None, base_url: str = "https://gitlab.com") -> dict:
+        """
+        List all GitLab repositories accessible by the token.
+
+        Args:
+            token: GitLab personal access token (defaults to GITLAB_TOKEN env var)
+            base_url: GitLab instance base URL (defaults to https://gitlab.com)
+
+        Returns:
+            Dictionary with status and list of repositories
+        """
+        try:
+            import urllib.request
+            import json as json_module
+
+            gitlab_token = token or self.gitlab_token
+            if not gitlab_token:
+                return {
+                    "status": "error",
+                    "message": "No GitLab token available. Set GITLAB_TOKEN environment variable.",
+                    "error": "No token"
+                }
+
+            self.logger.info(f"Listing GitLab repositories from {base_url}")
+
+            repositories = []
+            page = 1
+
+            while True:
+                api_url = f"{base_url}/api/v4/projects?membership=true&per_page=100&page={page}"
+                req = urllib.request.Request(api_url)
+                req.add_header('PRIVATE-TOKEN', gitlab_token)
+
+                with urllib.request.urlopen(req) as response:
+                    data = json_module.loads(response.read().decode('utf-8'))
+
+                if not data:
+                    break
+
+                for project in data:
+                    repositories.append({
+                        'name': project.get('path_with_namespace', project.get('name', '')),
+                        'clone_url_http': project.get('http_url_to_repo', ''),
+                        'description': project.get('description', '') or ''
+                    })
+
+                page += 1
+
+            self.logger.info(f"Found {len(repositories)} GitLab repositories")
+
+            return {
+                "status": "success",
+                "count": len(repositories),
+                "repositories": repositories
+            }
+
+        except Exception as e:
+            self.logger.error(f"Failed to list GitLab repositories: {str(e)}")
+            return {
+                "status": "error",
+                "message": f"Failed to list GitLab repositories: {str(e)}",
+                "error": str(e)
+            }
+
+    def list_bitbucket_repositories(self, username: str = None, app_password: str = None, workspace: str = None) -> dict:
+        """
+        List all Bitbucket repositories in the specified workspace.
+
+        Args:
+            username: Bitbucket username (defaults to BITBUCKET_USERNAME env var)
+            app_password: Bitbucket app password (defaults to BITBUCKET_APP_PASSWORD env var)
+            workspace: Bitbucket workspace slug (defaults to BITBUCKET_WORKSPACE env var or username)
+
+        Returns:
+            Dictionary with status and list of repositories
+        """
+        try:
+            import urllib.request
+            import json as json_module
+            import base64
+
+            bb_username = username or self.bitbucket_username
+            bb_app_password = app_password or self.bitbucket_app_password
+            bb_workspace = workspace or os.getenv('BITBUCKET_WORKSPACE', bb_username)
+
+            if not bb_username or not bb_app_password:
+                return {
+                    "status": "error",
+                    "message": "No Bitbucket credentials available. Set BITBUCKET_USERNAME and BITBUCKET_APP_PASSWORD.",
+                    "error": "No credentials"
+                }
+
+            if not bb_workspace:
+                return {
+                    "status": "error",
+                    "message": "No Bitbucket workspace specified. Set BITBUCKET_WORKSPACE environment variable.",
+                    "error": "No workspace"
+                }
+
+            self.logger.info(f"Listing Bitbucket repositories in workspace {bb_workspace}")
+
+            repositories = []
+            api_url = f"https://api.bitbucket.org/2.0/repositories/{bb_workspace}"
+
+            # Create basic auth header
+            credentials = base64.b64encode(f"{bb_username}:{bb_app_password}".encode()).decode()
+
+            while api_url:
+                req = urllib.request.Request(api_url)
+                req.add_header('Authorization', f'Basic {credentials}')
+
+                with urllib.request.urlopen(req) as response:
+                    data = json_module.loads(response.read().decode('utf-8'))
+
+                for repo in data.get('values', []):
+                    clone_url = ''
+                    for link in repo.get('links', {}).get('clone', []):
+                        if link.get('name') == 'https':
+                            clone_url = link.get('href', '')
+                            break
+
+                    repositories.append({
+                        'name': repo.get('full_name', repo.get('name', '')),
+                        'clone_url_http': clone_url,
+                        'description': repo.get('description', '') or ''
+                    })
+
+                api_url = data.get('next')
+
+            self.logger.info(f"Found {len(repositories)} Bitbucket repositories")
+
+            return {
+                "status": "success",
+                "count": len(repositories),
+                "repositories": repositories
+            }
+
+        except Exception as e:
+            self.logger.error(f"Failed to list Bitbucket repositories: {str(e)}")
+            return {
+                "status": "error",
+                "message": f"Failed to list Bitbucket repositories: {str(e)}",
+                "error": str(e)
+            }
+
+    def list_azure_devops_repositories(self, pat: str = None, organization: str = None, project: str = None) -> dict:
+        """
+        List all Azure DevOps repositories in the specified organization and project.
+
+        Args:
+            pat: Azure DevOps personal access token (defaults to AZURE_DEVOPS_PAT env var)
+            organization: Azure DevOps organization (defaults to AZURE_DEVOPS_ORG env var)
+            project: Azure DevOps project (defaults to AZURE_DEVOPS_PROJECT env var)
+
+        Returns:
+            Dictionary with status and list of repositories
+        """
+        try:
+            import urllib.request
+            import json as json_module
+            import base64
+
+            azure_pat = pat or self.azure_devops_pat
+            azure_org = organization or os.getenv('AZURE_DEVOPS_ORG')
+            azure_project = project or os.getenv('AZURE_DEVOPS_PROJECT')
+
+            if not azure_pat:
+                return {
+                    "status": "error",
+                    "message": "No Azure DevOps PAT available. Set AZURE_DEVOPS_PAT environment variable.",
+                    "error": "No PAT"
+                }
+
+            if not azure_org:
+                return {
+                    "status": "error",
+                    "message": "No Azure DevOps organization specified. Set AZURE_DEVOPS_ORG environment variable.",
+                    "error": "No organization"
+                }
+
+            if not azure_project:
+                return {
+                    "status": "error",
+                    "message": "No Azure DevOps project specified. Set AZURE_DEVOPS_PROJECT environment variable.",
+                    "error": "No project"
+                }
+
+            self.logger.info(f"Listing Azure DevOps repositories in {azure_org}/{azure_project}")
+
+            api_url = f"https://dev.azure.com/{azure_org}/{azure_project}/_apis/git/repositories?api-version=7.1"
+
+            # Create basic auth header (empty username, PAT as password)
+            credentials = base64.b64encode(f":{azure_pat}".encode()).decode()
+
+            req = urllib.request.Request(api_url)
+            req.add_header('Authorization', f'Basic {credentials}')
+
+            with urllib.request.urlopen(req) as response:
+                data = json_module.loads(response.read().decode('utf-8'))
+
+            repositories = []
+            for repo in data.get('value', []):
+                repositories.append({
+                    'name': repo.get('name', ''),
+                    'clone_url_http': repo.get('remoteUrl', ''),
+                    'description': repo.get('project', {}).get('description', '') or ''
+                })
+
+            self.logger.info(f"Found {len(repositories)} Azure DevOps repositories")
+
+            return {
+                "status": "success",
+                "count": len(repositories),
+                "repositories": repositories
+            }
+
+        except Exception as e:
+            self.logger.error(f"Failed to list Azure DevOps repositories: {str(e)}")
+            return {
+                "status": "error",
+                "message": f"Failed to list Azure DevOps repositories: {str(e)}",
+                "error": str(e)
+            }
+
     def _ensure_clean_directory(self, directory: str):
         """Ensure a directory is clean and ready for use."""
         if os.path.exists(directory):

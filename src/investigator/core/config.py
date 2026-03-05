@@ -9,16 +9,19 @@ class Config:
     """Configuration constants for the investigator."""
     
     # Claude API settings
-    CLAUDE_MODEL = "claude-opus-4-5-20251101"
+    CLAUDE_MODEL = "claude-sonnet-4-6-20260120"
     MAX_TOKENS = 6000
     
     # Valid Claude model names for validation (4.x models only)
     # See: https://platform.claude.com/docs/en/about-claude/models/overview
     VALID_CLAUDE_MODELS = [
-        # Claude 4.5 (current)
+        # Claude 4.6 (current)
+        "claude-opus-4-6-20260120",
+        "claude-sonnet-4-6-20260120",
+        # Claude 4.5
         "claude-sonnet-4-5-20250929",
         "claude-haiku-4-5-20251001",
-        "claude-opus-4-5-20251101",  # current default
+        "claude-opus-4-5-20251101",
         "claude-opus-4-1-20250805",
         # Claude 4.0 (legacy)
         "claude-sonnet-4-20250514",
