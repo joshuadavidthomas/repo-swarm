@@ -33,16 +33,27 @@ class DynamoDBClient:
         if table_name:
             self.table_name = table_name
         else:
-            # Try to get table name from SSM parameter store first
-            self.table_name = self._get_table_name_from_ssm()
-            if not self.table_name:
-                # Fallback to hardcoded default
-                self.table_name = "staging-repo-swarm-results"
-                logger.info(f"Using hardcoded default table name: {self.table_name}")
+            # Try environment variable first
+            env_table = os.environ.get('DYNAMODB_TABLE_NAME') or os.environ.get('DYNAMODB_TABLE')
+            if env_table:
+                self.table_name = env_table
+                logger.info(f"Using table name from environment: {self.table_name}")
+            else:
+                # Try to get table name from SSM parameter store
+                self.table_name = self._get_table_name_from_ssm()
+                if not self.table_name:
+                    # Fallback to hardcoded default
+                    self.table_name = "staging-repo-swarm-results"
+                    logger.info(f"Using hardcoded default table name: {self.table_name}")
         
         # Initialize boto3 DynamoDB resource
-        # The IAM role attached to the ECS task will provide credentials automatically
-        self.dynamodb = boto3.resource('dynamodb', region_name=os.environ.get('AWS_DEFAULT_REGION', 'us-east-1'))
+        # Support local DynamoDB for development
+        endpoint_url = os.environ.get('DYNAMODB_ENDPOINT')
+        kwargs = {'region_name': os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')}
+        if endpoint_url:
+            kwargs['endpoint_url'] = endpoint_url
+            logger.info(f"Using DynamoDB endpoint: {endpoint_url}")
+        self.dynamodb = boto3.resource('dynamodb', **kwargs)
         self.table = self.dynamodb.Table(self.table_name)
         
         logger.info(f"Initialized DynamoDB client for table: {self.table_name}")

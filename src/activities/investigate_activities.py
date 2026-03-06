@@ -1021,9 +1021,10 @@ async def analyze_with_claude_context(input_params: AnalyzeWithClaudeInput) -> A
         logger = logging.getLogger(__name__)
         
         # Initialize Claude analyzer
-        api_key = os.getenv('ANTHROPIC_API_KEY')
-        if not api_key:
-            raise Exception("Claude API key not configured. Set ANTHROPIC_API_KEY environment variable.")
+        use_bedrock = os.getenv('CLAUDE_PROVIDER') == 'bedrock' or os.getenv('CLAUDE_CODE_USE_BEDROCK') == '1'
+        api_key = os.getenv('ANTHROPIC_API_KEY', '')
+        if not api_key and not use_bedrock:
+            raise Exception("Claude API key not configured. Set ANTHROPIC_API_KEY or CLAUDE_PROVIDER=bedrock.")
             
         claude_analyzer = ClaudeAnalyzer(api_key, logger)
         

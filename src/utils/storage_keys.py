@@ -38,9 +38,8 @@ class PromptCacheKey(BaseModel):
     
     @validator('repo_name', 'step_name')
     def validate_no_special_chars(cls, v):
-        """Sanitize names for safe use in file names and storage keys."""
-        # Sanitize URLs and special chars instead of rejecting them
-        return _sanitize_for_filesystem(v)
+        """Accept any input — sanitization happens in to_file_safe_key()."""
+        return v
     
     @validator('commit_sha')
     def validate_commit_sha(cls, v):
