@@ -97,4 +97,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
 
 # Default command runs the worker using mise environment
 # Ensure all output goes to stdout/stderr for proper logging
-CMD ["/bin/bash", "-c", "/home/app/.local/bin/mise run worker 2>&1"] 
+CMD ["/bin/bash", "-c", "/home/app/.local/bin/mise run dev-worker 2>&1"] 
