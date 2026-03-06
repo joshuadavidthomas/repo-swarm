@@ -66,7 +66,10 @@ ENV TEMPORAL_API_KEY=${TEMPORAL_API_KEY}
 RUN /home/app/.local/bin/mise trust
 
 # Install mise tools (like Python, Temporal CLI)
-RUN /home/app/.local/bin/mise install
+# Fallback: if mise registry is down, install Temporal CLI directly
+RUN /home/app/.local/bin/mise install || \
+    (echo "mise install failed, installing Temporal CLI directly..." && \
+     curl -sSf https://temporal.download/cli.sh | sh -s -- --dir /home/app/.local/bin)
 
 # Install Python dependencies using uv
 RUN uv sync
