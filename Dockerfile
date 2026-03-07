@@ -86,15 +86,16 @@ ENV PYTHONIOENCODING=utf-8
 # Expose ports for health checks and metrics
 EXPOSE 4567 9090
 
-# Health check for ECS task - verifies the worker is running and updating its health file
-# ECS will use this to determine container health status
-# --interval: How often to check health (30s)
-# --timeout: How long to wait for health check to complete (10s)
-# --start-period: Grace period before health checks start counting (60s for worker startup)
-# --retries: How many consecutive failures before marking unhealthy (3)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD /home/app/.local/bin/mise exec python /app/src/health_check.py || exit 1
+# Activate the uv venv so the uv-installed packages are on PATH/PYTHONPATH
+# This avoids mise's separate Python install which doesn't see uv's packages
+ENV VIRTUAL_ENV=/app/.venv
+ENV PATH="/app/.venv/bin:$PATH"
 
-# Default command runs the worker using mise environment
-# Ensure all output goes to stdout/stderr for proper logging
-CMD ["/bin/bash", "-c", "/home/app/.local/bin/mise run dev-worker 2>&1"] 
+# Health check for ECS task - verifies the worker is running and updating its health file
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD python /app/src/health_check.py || exit 1
+
+# Run the worker directly using the uv venv Python (not mise exec)
+# WORKDIR is /app, and PYTHONPATH includes /app/src, so the module resolves correctly
+WORKDIR /app/src
+CMD ["python", "-m", "investigate_worker"] 
