@@ -59,9 +59,30 @@ class InvestigateSingleRepoWorkflow:
         self._last_heartbeat = None
         self._investigation_progress = None
         self._repo_name = None
-    
+        self._current_step = 0
+        self._total_steps = 8  # health_check, clone, cache, structure, prompts, deps, analyze, write
+        self._step_name = "initialized"
+
+    @workflow.query
+    def get_progress(self) -> dict:
+        """Query to get current workflow progress."""
+        return {
+            "current_step": self._current_step,
+            "total_steps": self._total_steps,
+            "step_name": self._step_name,
+            "status": self._status,
+            "repo_name": self._repo_name
+        }
+
+    @workflow.query
+    def get_status(self) -> str:
+        """Query to get current workflow status."""
+        return self._status
+
     async def _perform_health_check(self) -> None:
         """Perform DynamoDB health check before starting investigation."""
+        self._current_step = 1
+        self._step_name = "health_check"
         self._status = "health_check"
         self._last_heartbeat = workflow.now()
         logger.info("Performing DynamoDB health check before starting investigation")
@@ -88,6 +109,8 @@ class InvestigateSingleRepoWorkflow:
 
     async def _clone_repository(self, repo_url: str, repo_name: str) -> CloneRepositoryResult:
         """Clone the repository and return clone results."""
+        self._current_step = 2
+        self._step_name = "cloning"
         self._status = "cloning"
         self._last_heartbeat = workflow.now()
         
@@ -120,6 +143,8 @@ class InvestigateSingleRepoWorkflow:
         else:
             workflow.logger.warning(f"   ⚠️  NO PROMPT VERSIONS provided to cache check")
         
+        self._current_step = 3
+        self._step_name = "checking_cache"
         self._status = "checking_cache"
         self._last_heartbeat = workflow.now()
         
@@ -150,6 +175,8 @@ class InvestigateSingleRepoWorkflow:
 
     async def _analyze_repository_structure(self, repo_path: str) -> Dict:
         """Analyze the repository structure."""
+        self._current_step = 4
+        self._step_name = "analyzing_structure"
         self._status = "analyzing_structure"
         self._last_heartbeat = workflow.now()
         
@@ -167,6 +194,8 @@ class InvestigateSingleRepoWorkflow:
 
     async def _get_prompts_config(self, repo_path: str, repo_type: str, repo_url: str) -> PromptsConfigResult:
         """Get prompts configuration for the repository."""
+        self._current_step = 5
+        self._step_name = "getting_prompts"
         self._status = "getting_prompts"
         self._last_heartbeat = workflow.now()
         
@@ -191,6 +220,8 @@ class InvestigateSingleRepoWorkflow:
 
     async def _read_and_cache_dependencies(self, repo_path: str) -> dict:
         """Read dependency files and cache them."""
+        self._current_step = 6
+        self._step_name = "reading_dependencies"
         self._status = "reading_dependencies"
         self._last_heartbeat = workflow.now()
         
@@ -249,7 +280,9 @@ class InvestigateSingleRepoWorkflow:
         """Process each analysis step using PromptContext for cleaner abstraction."""
         if config_overrides is None:
             config_overrides = ConfigOverrides()
-        
+
+        self._current_step = 7
+        self._step_name = "analyzing"
         self._status = "analyzing"
         self._last_heartbeat = workflow.now()
         
@@ -453,6 +486,8 @@ class InvestigateSingleRepoWorkflow:
 
     async def _write_analysis_results(self, temp_dir: str, repo_path: str, final_analysis: str) -> WriteResultsOutput:
         """Write final analysis to file."""
+        self._current_step = 8
+        self._step_name = "writing_results"
         self._status = "writing_results"
         self._last_heartbeat = workflow.now()
         
