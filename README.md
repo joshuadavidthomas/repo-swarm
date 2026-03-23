@@ -249,6 +249,40 @@ RepoSwarm was born out of a hackathon at [Verbit](https://verbit.ai/), built by:
 
 ---
 
+## Recent Fixes (2026-03-23)
+
+### 🔧 DynamoDB Local — Table Creation Fails on Fresh Install
+
+**Symptom:** `reposwarm repos add` returns 500 with "Request must contain either a valid AWS access key ID or X.509 certificate." `reposwarm doctor` shows `DynamoDB — DISCONNECTED` even though the container is running.
+
+**Root cause:** The API server used a no-op SigV4 signer (`signer: { sign: async (req) => req }`) that stripped all auth headers. DynamoDB Local accepts unsigned requests for data operations (PutItem, GetItem) but rejects control plane operations (CreateTable, DescribeTable) with `MissingAuthenticationToken`. This caused `ensureTable()` to silently fail on startup — the table was never created, and all subsequent operations returned 500.
+
+**Fix:** Removed the no-op signer. DynamoDB Local needs valid SigV4 signatures but doesn't verify the actual credentials — dummy static credentials with normal signing work fine.
+
+**Update:** `docker compose pull api && docker compose up -d api`
+
+### 🔧 Anthropic Provider — API Key Not Written to worker.env
+
+**Symptom:** After running `reposwarm config provider setup` with the Anthropic provider, the `ANTHROPIC_API_KEY` was never written to `worker.env`. Investigations fail with authentication errors even though the key was entered during setup.
+
+**Fix:** Added `APIKey` field to the provider config struct, added `--api-key` flag and interactive prompt, and wired it through to `WorkerEnvVars()` for Anthropic.
+
+**Update:** `curl -fsSL https://raw.githubusercontent.com/reposwarm/reposwarm-cli/main/install.sh | sh`
+
+### 🔧 Provider Switch — Stale Bedrock Env Vars Survive
+
+**Symptom:** Switching from Bedrock to Anthropic (or vice versa) left stale environment variables (`CLAUDE_CODE_USE_BEDROCK=1`, `CLAUDE_PROVIDER=bedrock`) in `worker.env`, causing the worker to stay in Bedrock mode.
+
+**Fix:** Added provider-aware cleanup to `writeWorkerEnvForProvider()` — removes exclusive env vars from other providers when switching.
+
+### 🔧 DynamoDB Local — Fails on Machines Without AWS Credentials
+
+**Symptom:** On fresh EC2 instances or machines without IAM roles or `~/.aws/credentials`, the API and worker containers fail because the AWS SDK tries to resolve credentials via IMDS and hangs.
+
+**Fix:** Added dummy `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` defaults to API, worker, and UI services in the Docker Compose template. DynamoDB Local accepts any credentials.
+
+---
+
 ## License
 
 This project is licensed under the [Apache License 2.0](LICENSE).
