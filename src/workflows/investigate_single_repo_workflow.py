@@ -90,7 +90,7 @@ class InvestigateSingleRepoWorkflow:
         health_check_result = await workflow.execute_activity(
             check_dynamodb_health,
             args=[],
-            start_to_close_timeout=timedelta(seconds=30),
+            start_to_close_timeout=timedelta(seconds=120),  # Increased from 30s to allow for worker cold starts
             retry_policy=RetryPolicy(
                 maximum_attempts=3,  # Fail after 3 attempts as requested
                 initial_interval=timedelta(seconds=10),  # 10 seconds apart as requested
@@ -117,11 +117,12 @@ class InvestigateSingleRepoWorkflow:
         clone_result = await workflow.execute_activity(
             clone_repository_activity,
             args=[repo_url, repo_name],
-            start_to_close_timeout=timedelta(minutes=3),
+            start_to_close_timeout=timedelta(minutes=10),  # Increased from 3min; large repos (react, nextjs) need more time
             retry_policy=RetryPolicy(
                 maximum_attempts=3,
-                initial_interval=timedelta(seconds=5),
-                maximum_interval=timedelta(minutes=1),
+                initial_interval=timedelta(seconds=10),
+                maximum_interval=timedelta(minutes=2),
+                backoff_coefficient=2.0,
             ),
         )
         
