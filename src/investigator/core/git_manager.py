@@ -5,6 +5,7 @@ Git repository management for the Claude Investigator.
 import os
 import shutil
 import subprocess
+import tempfile
 from urllib.parse import urlparse, urlunparse, quote
 from .utils import Utils
 
@@ -136,7 +137,6 @@ class GitRepositoryManager:
         This strips them to prevent credential leakage via .git/config.
         """
         try:
-            import subprocess
             result = subprocess.run(
                 ["git", "remote", "get-url", "origin"],
                 cwd=repo_dir, capture_output=True, text=True
@@ -167,6 +167,10 @@ class GitRepositoryManager:
         """
         Clone a repository or update it if it already exists.
         
+        Uses git credential helper to inject authentication — credentials
+        are never embedded in URLs, preventing leakage in logs, error
+        messages, process listings, and workflow history.
+        
         Args:
             repo_location: URL or path to the repository
             target_dir: Directory to clone/update the repository
@@ -174,163 +178,142 @@ class GitRepositoryManager:
         Returns:
             Path to the repository
         """
-        # Add authentication to the URL if needed
-        auth_repo_location = self._add_authentication(repo_location)
-        
-        if self._is_existing_repo(target_dir):
-            result = self._update_repository(target_dir, auth_repo_location)
-        else:
-            result = self._clone_repository(auth_repo_location, target_dir)
-        
-        # Strip credentials from .git/config to prevent leakage
-        self._strip_credentials_from_remote(result)
-        return result
-    
-    def _add_authentication(self, repo_location: str) -> str:
-        """
-        Add authentication to repository URL if available (GitHub or CodeCommit).
+        # Set up credential helper (creds stay out of URLs)
+        cred_path = None
+        if repo_location.startswith(('http://', 'https://')):
+            cred_path = self._write_credential_store(repo_location)
+            if cred_path:
+                self._configure_git_credential_helper(cred_path)
 
-        Args:
-            repo_location: Original repository URL
+        try:
+            if self._is_existing_repo(target_dir):
+                result = self._update_repository(target_dir, repo_location)
+            else:
+                result = self._clone_repository(repo_location, target_dir)
+            return result
+        finally:
+            if cred_path:
+                self._cleanup_credential_store(cred_path)
+    
+    def _get_credentials_for_url(self, repo_url: str) -> tuple[str, str] | None:
+        """
+        Get the username and password for a repository URL based on provider.
 
         Returns:
-            Repository URL with authentication added if applicable
+            Tuple of (username, password) or None if no credentials available.
         """
-        # Only process URLs, not local paths
-        if not repo_location.startswith(('http://', 'https://')):
-            return repo_location
+        if self._is_codecommit_url(repo_url):
+            if self.codecommit_username and self.codecommit_password:
+                return (self.codecommit_username, self.codecommit_password)
+        elif 'github.com' in repo_url:
+            if self.github_token:
+                return ('x-access-token', self.github_token)
+        elif self._is_gitlab_url(repo_url):
+            if self.gitlab_token:
+                return ('oauth2', self.gitlab_token)
+        elif self._is_bitbucket_url(repo_url):
+            if self.bitbucket_username and self.bitbucket_app_password:
+                return (self.bitbucket_username, self.bitbucket_app_password)
+        elif self._is_azure_devops_url(repo_url):
+            if self.azure_devops_pat:
+                return ('', self.azure_devops_pat)
+        return None
 
-        # Parse the URL
-        parsed = urlparse(repo_location)
+    def _write_credential_store(self, repo_url: str) -> str | None:
+        """
+        Write a temporary git credential store file for the given repo URL.
 
-        # If authentication already exists, don't override
-        if parsed.username:
-            self.logger.debug("Authentication already present in URL, not overriding")
-            return repo_location
+        Credentials are stored in a temp file using the git credential store format:
+        https://user:pass@host — git reads this file instead of embedding creds in URLs.
 
-        # Handle CodeCommit repositories
-        if self._is_codecommit_url(repo_location):
-            if not self.codecommit_username or not self.codecommit_password:
-                self.logger.warning("CodeCommit URL detected but credentials not available")
-                return repo_location
+        Returns:
+            Path to the temp credential file, or None if no credentials available.
+        """
+        creds = self._get_credentials_for_url(repo_url)
+        if not creds:
+            return None
 
-            # Add CodeCommit HTTPS Git credentials (URL-encode to handle special chars like / in password)
-            auth_netloc = f"{quote(self.codecommit_username, safe='')}:{quote(self.codecommit_password, safe='')}@{parsed.hostname}"
-            if parsed.port:
-                auth_netloc += f":{parsed.port}"
+        username, password = creds
+        parsed = urlparse(repo_url)
+        host = parsed.hostname or ''
 
-            # Reconstruct the URL with authentication
-            auth_url = urlunparse((
-                parsed.scheme,
-                auth_netloc,
-                parsed.path,
-                parsed.params,
-                parsed.query,
-                parsed.fragment
-            ))
+        # Build credential store entry: protocol://user:pass@host
+        entry = f"{parsed.scheme}://{quote(username, safe='')}:{quote(password, safe='')}@{host}"
 
-            self.logger.debug("Added CodeCommit HTTPS authentication to repository URL")
-            return auth_url
+        # Write to a secure temp file (fd-based, not world-readable)
+        fd, cred_path = tempfile.mkstemp(prefix='git-creds-', suffix='.store')
+        try:
+            os.write(fd, (entry + '\n').encode())
+        finally:
+            os.close(fd)
+        os.chmod(cred_path, 0o600)
 
-        # Handle GitHub repositories
-        if 'github.com' in repo_location:
-            if not self.github_token:
-                return repo_location
+        provider = self._detect_provider_name(repo_url)
+        self.logger.debug(f"Configured git credential store for {provider}")
+        return cred_path
 
-            # Add token authentication
-            # GitHub accepts the token as username with no password
-            auth_netloc = f"x-access-token:{self.github_token}@{parsed.hostname}"
-            if parsed.port:
-                auth_netloc += f":{parsed.port}"
+    def _configure_git_credential_helper(self, cred_path: str, work_dir: str = None) -> None:
+        """Configure git to use the credential store file."""
+        cmd = ["git", "config", "--global", "credential.helper", f"store --file={cred_path}"]
+        subprocess.run(cmd, cwd=work_dir, check=True, capture_output=True)
 
-            # Reconstruct the URL with authentication
-            auth_url = urlunparse((
-                parsed.scheme,
-                auth_netloc,
-                parsed.path,
-                parsed.params,
-                parsed.query,
-                parsed.fragment
-            ))
+    def _cleanup_credential_store(self, cred_path: str) -> None:
+        """Securely remove the temporary credential store file and reset git config."""
+        try:
+            if cred_path and os.path.exists(cred_path):
+                os.remove(cred_path)
+            # Reset credential helper to avoid stale references
+            subprocess.run(
+                ["git", "config", "--global", "--unset", "credential.helper"],
+                capture_output=True
+            )
+        except Exception as e:
+            self.logger.debug(f"Credential cleanup note: {e}")
 
-            self.logger.debug("Added GitHub token authentication to repository URL")
-            return auth_url
+    def _detect_provider_name(self, url: str) -> str:
+        """Return a human-readable provider name for logging (no secrets)."""
+        if self._is_codecommit_url(url):
+            return "CodeCommit"
+        if 'github.com' in url:
+            return "GitHub"
+        if self._is_gitlab_url(url):
+            return "GitLab"
+        if self._is_bitbucket_url(url):
+            return "Bitbucket"
+        if self._is_azure_devops_url(url):
+            return "Azure DevOps"
+        return "unknown"
 
-        # Handle GitLab repositories
-        if self._is_gitlab_url(repo_location):
-            if not self.gitlab_token:
-                self.logger.warning("GitLab URL detected but token not available")
-                return repo_location
+    def _sanitize_error_message(self, error_msg: str) -> str:
+        """
+        Remove ALL known credentials from an error message.
 
-            auth_netloc = f"oauth2:{self.gitlab_token}@{parsed.hostname}"
-            if parsed.port:
-                auth_netloc += f":{parsed.port}"
-
-            auth_url = urlunparse((
-                parsed.scheme,
-                auth_netloc,
-                parsed.path,
-                parsed.params,
-                parsed.query,
-                parsed.fragment
-            ))
-
-            self.logger.debug("Added GitLab token authentication to repository URL")
-            return auth_url
-
-        # Handle Bitbucket repositories
-        if self._is_bitbucket_url(repo_location):
-            if not self.bitbucket_username or not self.bitbucket_app_password:
-                self.logger.warning("Bitbucket URL detected but credentials not available")
-                return repo_location
-
-            auth_netloc = f"{self.bitbucket_username}:{self.bitbucket_app_password}@{parsed.hostname}"
-            if parsed.port:
-                auth_netloc += f":{parsed.port}"
-
-            auth_url = urlunparse((
-                parsed.scheme,
-                auth_netloc,
-                parsed.path,
-                parsed.params,
-                parsed.query,
-                parsed.fragment
-            ))
-
-            self.logger.debug("Added Bitbucket authentication to repository URL")
-            return auth_url
-
-        # Handle Azure DevOps repositories
-        if self._is_azure_devops_url(repo_location):
-            if not self.azure_devops_pat:
-                self.logger.warning("Azure DevOps URL detected but PAT not available")
-                return repo_location
-
-            auth_netloc = f":{self.azure_devops_pat}@{parsed.hostname}"
-            if parsed.port:
-                auth_netloc += f":{parsed.port}"
-
-            auth_url = urlunparse((
-                parsed.scheme,
-                auth_netloc,
-                parsed.path,
-                parsed.params,
-                parsed.query,
-                parsed.fragment
-            ))
-
-            self.logger.debug("Added Azure DevOps PAT authentication to repository URL")
-            return auth_url
-
-        # For other URLs, return as-is
-        return repo_location
+        Checks all configured tokens/passwords, not just GitHub.
+        """
+        secrets = [
+            self.github_token,
+            self.codecommit_password,
+            self.codecommit_username,
+            self.gitlab_token,
+            self.bitbucket_app_password,
+            self.bitbucket_username,
+            self.azure_devops_pat,
+        ]
+        for secret in secrets:
+            if secret and secret in error_msg:
+                error_msg = error_msg.replace(secret, '***')
+        return error_msg
     
     def _is_existing_repo(self, repo_dir: str) -> bool:
         """Check if a directory contains a valid Git repository."""
         return os.path.exists(repo_dir) and os.path.exists(os.path.join(repo_dir, '.git'))
     
-    def _update_repository(self, repo_dir: str, auth_repo_location: str) -> str:
-        """Update an existing repository with latest changes."""
+    def _update_repository(self, repo_dir: str, repo_location: str) -> str:
+        """Update an existing repository with latest changes.
+        
+        Authentication is handled by the git credential helper configured
+        in clone_or_update — no need to embed creds in remote URLs.
+        """
         self.logger.info(f"Repository already exists at: {repo_dir}")
         try:
             import git
@@ -338,27 +321,6 @@ class GitRepositoryManager:
             self.logger.info("Pulling latest changes from remote repository")
 
             origin = repo.remotes.origin
-
-            # Update remote URL with authentication if needed
-            current_url = origin.url
-            if '@' not in current_url:
-                # Check if it's GitHub or CodeCommit
-                if self.github_token and 'github.com' in current_url:
-                    self.logger.debug("Updating remote URL with GitHub authentication")
-                    origin.set_url(auth_repo_location)
-                elif self._is_codecommit_url(current_url) and self.codecommit_username:
-                    self.logger.debug("Updating remote URL with CodeCommit authentication")
-                    origin.set_url(auth_repo_location)
-                elif self._is_gitlab_url(current_url) and self.gitlab_token:
-                    self.logger.debug("Updating remote URL with GitLab authentication")
-                    origin.set_url(auth_repo_location)
-                elif self._is_bitbucket_url(current_url) and self.bitbucket_username:
-                    self.logger.debug("Updating remote URL with Bitbucket authentication")
-                    origin.set_url(auth_repo_location)
-                elif self._is_azure_devops_url(current_url) and self.azure_devops_pat:
-                    self.logger.debug("Updating remote URL with Azure DevOps authentication")
-                    origin.set_url(auth_repo_location)
-
             origin.fetch()
             origin.pull()
 
@@ -366,10 +328,9 @@ class GitRepositoryManager:
             return repo_dir
 
         except Exception as e:
-            # Import git to check for GitCommandError
             import git
             if isinstance(e, git.exc.GitCommandError):
-                self.logger.warning(f"Failed to pull latest changes: {str(e)}")
+                self.logger.warning(f"Failed to pull latest changes: {self._sanitize_error_message(str(e))}")
                 self.logger.info("Falling back to cloning the repository")
                 shutil.rmtree(repo_dir)
                 raise
@@ -377,17 +338,21 @@ class GitRepositoryManager:
                 raise
     
     def _clone_repository(self, repo_location: str, target_dir: str) -> str:
-        """Clone a new repository."""
+        """Clone a new repository.
+        
+        Authentication is handled by the git credential helper — the URL
+        passed here should be clean (no embedded credentials).
+        """
         self._ensure_clean_directory(target_dir)
         
         try:
             import git
-            # Log sanitized URL without exposing sensitive information
             safe_url = self._sanitize_url_for_logging(repo_location)
             self.logger.info(f"Cloning repository from: {safe_url}")
             
-            if self.github_token and self.github_token in repo_location:
-                self.logger.info("Using GitHub token authentication for private repository access")
+            provider = self._detect_provider_name(repo_location)
+            if self._get_credentials_for_url(repo_location):
+                self.logger.info(f"Using {provider} authentication via credential helper")
             
             git.Repo.clone_from(repo_location, target_dir)
             self.logger.info(f"Repository successfully cloned to: {target_dir}")
@@ -396,31 +361,27 @@ class GitRepositoryManager:
         except Exception as e:
             import git
             if isinstance(e, git.exc.GitCommandError):
-                self.logger.error(f"Git clone failed: {str(e)}")
+                sanitized = self._sanitize_error_message(str(e))
+                self.logger.error(f"Git clone failed: {sanitized}")
                 
                 # Check if it's a resource issue (exit code -9 or similar)
                 if "exit code(-9)" in str(e) or "Killed" in str(e):
                     self.logger.warning("Detected potential resource issue, attempting shallow clone")
-                    # Clean up failed attempt
                     if os.path.exists(target_dir):
                         shutil.rmtree(target_dir, ignore_errors=True)
                     
-                    # Try shallow clone as fallback
                     try:
                         return self._shallow_clone_fallback(repo_location, target_dir)
                     except Exception as shallow_error:
-                        self.logger.error(f"Shallow clone also failed: {str(shallow_error)}")
-                        raise Exception(f"Failed to clone repository even with shallow clone: {str(shallow_error)}")
+                        shallow_msg = self._sanitize_error_message(str(shallow_error))
+                        self.logger.error(f"Shallow clone also failed: {shallow_msg}")
+                        raise Exception(f"Failed to clone repository even with shallow clone: {shallow_msg}")
                 
-                # Don't include the full error message as it might contain the token
-                if self.github_token and "Authentication failed" in str(e):
-                    raise Exception("Failed to clone repository: Authentication failed. Please check your GITHUB_TOKEN.")
+                if "Authentication failed" in str(e):
+                    provider = self._detect_provider_name(repo_location)
+                    raise Exception(f"Failed to clone repository: Authentication failed for {provider}. Check credentials.")
                 
-                # Sanitize error message to remove any tokens
-                error_msg = str(e)
-                if self.github_token and self.github_token in error_msg:
-                    error_msg = error_msg.replace(self.github_token, '***HIDDEN***')
-                raise Exception(f"Failed to clone repository: {error_msg}")
+                raise Exception(f"Failed to clone repository: {sanitized}")
             else:
                 raise
     
@@ -428,46 +389,29 @@ class GitRepositoryManager:
         """
         Perform a shallow clone as a fallback when normal clone fails due to resource constraints.
         
-        Args:
-            repo_location: Repository URL to clone (with authentication if needed)
-            target_dir: Target directory for the clone
-            
-        Returns:
-            Path to the cloned repository
+        Authentication is handled by the git credential helper — URLs stay clean.
         """
-        import subprocess
-        
         self.logger.info("Attempting shallow clone with depth=1 to reduce memory usage")
-        
-        # Ensure target directory is clean
         self._ensure_clean_directory(target_dir)
         
-        # Build git clone command with shallow options
         cmd = [
             'git', 'clone',
             '--depth', '1',
-            '--single-branch',  # Only clone the default branch
-            '--no-tags',  # Don't fetch tags to save space
+            '--single-branch',
+            '--no-tags',
             repo_location,
             target_dir
         ]
         
-        # Mask the token in command for logging
-        log_cmd = ' '.join(cmd)
-        if self.github_token and self.github_token in log_cmd:
-            log_cmd = log_cmd.replace(self.github_token, '***HIDDEN***')
-        # Also sanitize the URL in the command
         safe_url = self._sanitize_url_for_logging(repo_location)
-        if repo_location in log_cmd:
-            log_cmd = log_cmd.replace(repo_location, safe_url)
-        self.logger.debug(f"Shallow clone command: {log_cmd}")
+        self.logger.debug(f"Shallow clone target: {safe_url}")
         
         try:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=600,  # 10 minute timeout
+                timeout=600,
                 check=True
             )
             
@@ -475,47 +419,30 @@ class GitRepositoryManager:
             return target_dir
             
         except subprocess.CalledProcessError as e:
-            # Check if it's still a resource issue
             if e.returncode == -9 or "Killed" in e.stderr:
                 self.logger.error("Even shallow clone was killed - severe resource constraints")
-                # Try one more time with minimal clone
                 return self._minimal_clone_fallback(repo_location, target_dir)
             
-            # Clean up error message to not expose token
-            error_msg = e.stderr
-            if self.github_token and self.github_token in error_msg:
-                error_msg = error_msg.replace(self.github_token, '***HIDDEN***')
-            
+            error_msg = self._sanitize_error_message(e.stderr)
             raise Exception(f"Shallow clone failed: {error_msg}")
         except subprocess.TimeoutExpired:
             raise Exception("Shallow clone timed out after 10 minutes")
     
     def _minimal_clone_fallback(self, repo_location: str, target_dir: str) -> str:
         """
-        Perform a minimal clone with the most aggressive optimizations for extremely constrained environments.
+        Perform a minimal clone with aggressive optimizations for constrained environments.
         
-        Args:
-            repo_location: Repository URL to clone (with authentication if needed)
-            target_dir: Target directory for the clone
-            
-        Returns:
-            Path to the cloned repository
+        Authentication is handled by the git credential helper.
         """
-        import subprocess
-        
         self.logger.info("Attempting minimal clone with aggressive optimizations")
-        
-        # Ensure target directory exists
         os.makedirs(target_dir, exist_ok=True)
         
         try:
-            # Initialize repository
-            subprocess.run(['git', 'init'], cwd=target_dir, check=True)
+            subprocess.run(['git', 'init'], cwd=target_dir, check=True, capture_output=True)
             
-            # Add remote (don't log the URL with potential token)
             safe_url = self._sanitize_url_for_logging(repo_location)
             self.logger.debug(f"Adding remote origin: {safe_url}")
-            subprocess.run(['git', 'remote', 'add', 'origin', repo_location], cwd=target_dir, check=True)
+            subprocess.run(['git', 'remote', 'add', 'origin', repo_location], cwd=target_dir, check=True, capture_output=True)
             
             # Configure git to minimize memory usage
             subprocess.run(['git', 'config', 'core.compression', '0'], cwd=target_dir, check=True)
@@ -550,11 +477,7 @@ class GitRepositoryManager:
             return target_dir
             
         except subprocess.CalledProcessError as e:
-            # Clean up error message to not expose token
-            error_msg = str(e)
-            if self.github_token and self.github_token in error_msg:
-                error_msg = error_msg.replace(self.github_token, '***HIDDEN***')
-            
+            error_msg = self._sanitize_error_message(str(e))
             raise Exception(f"Minimal clone failed: {error_msg}")
         except subprocess.TimeoutExpired:
             raise Exception("Minimal clone timed out after 10 minutes")
@@ -582,102 +505,38 @@ class GitRepositoryManager:
 
     def push_with_authentication(self, repo_dir: str, branch: str = "main") -> dict:
         """
-        Push changes to remote repository with proper authentication (GitHub or CodeCommit).
+        Push changes to remote repository with proper authentication.
 
-        Args:
-            repo_dir: Directory containing the git repository
-            branch: Branch to push to (default: main)
-
-        Returns:
-            Dictionary with push result status and message
+        Uses git credential helper — credentials are never embedded in URLs.
         """
+        cred_path = None
         try:
             # Get current remote URL
             result = subprocess.run(
                 ["git", "remote", "get-url", "origin"],
-                cwd=repo_dir,
-                capture_output=True,
-                text=True
+                cwd=repo_dir, capture_output=True, text=True
             )
 
             if result.returncode == 0:
                 current_url = result.stdout.strip()
-
-                # Log current remote URL (sanitized)
                 safe_url = self._sanitize_url_for_logging(current_url)
                 self.logger.info(f"Current remote URL: {safe_url}")
 
-                # Add authentication if not already present
-                if '@' not in current_url:
-                    # Check if it's GitHub
-                    if 'github.com' in current_url and self.github_token:
-                        if current_url.startswith('https://'):
-                            auth_url = current_url.replace('https://', f'https://x-access-token:{self.github_token}@')
-                            self.logger.info("Updating remote URL with GitHub token for push")
-                            subprocess.run(
-                                ["git", "remote", "set-url", "origin", auth_url],
-                                cwd=repo_dir,
-                                check=True
-                            )
-                    # Check if it's CodeCommit
-                    elif self._is_codecommit_url(current_url) and self.codecommit_username and self.codecommit_password:
-                        if current_url.startswith('https://'):
-                            auth_url = current_url.replace('https://', f'https://{self.codecommit_username}:{self.codecommit_password}@')
-                            self.logger.info("Updating remote URL with CodeCommit credentials for push")
-                            subprocess.run(
-                                ["git", "remote", "set-url", "origin", auth_url],
-                                cwd=repo_dir,
-                                check=True
-                            )
-                    # Check if it's GitLab
-                    elif self._is_gitlab_url(current_url) and self.gitlab_token:
-                        if current_url.startswith('https://'):
-                            auth_url = current_url.replace('https://', f'https://oauth2:{self.gitlab_token}@')
-                            self.logger.info("Updating remote URL with GitLab token for push")
-                            subprocess.run(
-                                ["git", "remote", "set-url", "origin", auth_url],
-                                cwd=repo_dir,
-                                check=True
-                            )
-                    # Check if it's Bitbucket
-                    elif self._is_bitbucket_url(current_url) and self.bitbucket_username and self.bitbucket_app_password:
-                        if current_url.startswith('https://'):
-                            auth_url = current_url.replace('https://', f'https://{self.bitbucket_username}:{self.bitbucket_app_password}@')
-                            self.logger.info("Updating remote URL with Bitbucket credentials for push")
-                            subprocess.run(
-                                ["git", "remote", "set-url", "origin", auth_url],
-                                cwd=repo_dir,
-                                check=True
-                            )
-                    # Check if it's Azure DevOps
-                    elif self._is_azure_devops_url(current_url) and self.azure_devops_pat:
-                        if current_url.startswith('https://'):
-                            auth_url = current_url.replace('https://', f'https://:{self.azure_devops_pat}@')
-                            self.logger.info("Updating remote URL with Azure DevOps PAT for push")
-                            subprocess.run(
-                                ["git", "remote", "set-url", "origin", auth_url],
-                                cwd=repo_dir,
-                                check=True
-                            )
-                    else:
-                        self.logger.warning("No credentials available for this repository type")
-                else:
-                    self.logger.info("Remote URL already has authentication")
+                # Set up credential helper for the push
+                cred_path = self._write_credential_store(current_url)
+                if cred_path:
+                    self._configure_git_credential_helper(cred_path)
+                    provider = self._detect_provider_name(current_url)
+                    self.logger.info(f"Using {provider} authentication via credential helper for push")
             
             # Perform the push
             push_result = subprocess.run(
                 ["git", "push", "origin", branch],
-                cwd=repo_dir,
-                capture_output=True,
-                text=True
+                cwd=repo_dir, capture_output=True, text=True
             )
             
             if push_result.returncode != 0:
-                # Sanitize error message to avoid exposing tokens
-                error_msg = push_result.stderr
-                if self.github_token and self.github_token in error_msg:
-                    error_msg = error_msg.replace(self.github_token, '***HIDDEN***')
-                
+                error_msg = self._sanitize_error_message(push_result.stderr)
                 return {
                     "status": "failed",
                     "message": f"Failed to push changes: {error_msg}",
@@ -692,15 +551,15 @@ class GitRepositoryManager:
             }
             
         except Exception as e:
-            error_msg = str(e)
-            if self.github_token and self.github_token in error_msg:
-                error_msg = error_msg.replace(self.github_token, '***HIDDEN***')
-            
+            error_msg = self._sanitize_error_message(str(e))
             return {
                 "status": "failed",
                 "message": f"Push operation failed: {error_msg}",
                 "error": error_msg
             }
+        finally:
+            if cred_path:
+                self._cleanup_credential_store(cred_path)
     
     def validate_github_token(self) -> dict:
         """

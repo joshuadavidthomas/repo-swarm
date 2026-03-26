@@ -1,6 +1,6 @@
 """
 Unit tests for CodeCommit adapter in GitRepositoryManager.
-Tests the CodeCommit URL detection, authentication, and repository listing functionality.
+Tests the CodeCommit URL detection, credential helper, and repository listing functionality.
 """
 
 import pytest
@@ -56,11 +56,11 @@ class TestCodeCommitURLDetection:
         assert manager._is_codecommit_url(url) is False
 
 
-class TestCodeCommitAuthentication:
-    """Tests for CodeCommit authentication in _add_authentication."""
+class TestCodeCommitCredentialHelper:
+    """Tests for CodeCommit credential helper (replaces _add_authentication)."""
 
-    def test_add_authentication_with_codecommit_credentials(self):
-        """Test that CodeCommit credentials are added to CodeCommit URLs."""
+    def test_get_credentials_with_codecommit_credentials(self):
+        """Test that CodeCommit credentials are returned for CodeCommit URLs."""
         mock_logger = Mock()
 
         with patch.dict(os.environ, {
@@ -70,26 +70,24 @@ class TestCodeCommitAuthentication:
             manager = GitRepositoryManager(mock_logger)
             url = "https://git-codecommit.us-east-1.amazonaws.com/v1/repos/test-repo"
 
-            auth_url = manager._add_authentication(url)
+            creds = manager._get_credentials_for_url(url)
 
-            assert auth_url == "https://test-user:test-pass@git-codecommit.us-east-1.amazonaws.com/v1/repos/test-repo"
-            mock_logger.debug.assert_called_with("Added CodeCommit HTTPS authentication to repository URL")
+            assert creds == ('test-user', 'test-pass')
 
-    def test_add_authentication_without_codecommit_credentials(self):
-        """Test that CodeCommit URLs without credentials are returned as-is with warning."""
+    def test_get_credentials_without_codecommit_credentials(self):
+        """Test that None is returned for CodeCommit URLs without credentials."""
         mock_logger = Mock()
 
         with patch.dict(os.environ, {}, clear=True):
             manager = GitRepositoryManager(mock_logger)
             url = "https://git-codecommit.us-east-1.amazonaws.com/v1/repos/test-repo"
 
-            auth_url = manager._add_authentication(url)
+            creds = manager._get_credentials_for_url(url)
 
-            assert auth_url == url
-            mock_logger.warning.assert_called_with("CodeCommit URL detected but credentials not available")
+            assert creds is None
 
-    def test_add_authentication_github_still_works(self):
-        """Test that GitHub authentication still works when CodeCommit credentials are present."""
+    def test_get_credentials_github_when_both_present(self):
+        """Test that GitHub credentials are returned for GitHub URLs even when CodeCommit creds exist."""
         mock_logger = Mock()
 
         with patch.dict(os.environ, {
@@ -100,29 +98,53 @@ class TestCodeCommitAuthentication:
             manager = GitRepositoryManager(mock_logger)
             url = "https://github.com/user/repo"
 
-            auth_url = manager._add_authentication(url)
+            creds = manager._get_credentials_for_url(url)
 
-            assert auth_url == "https://x-access-token:github-token@github.com/user/repo"
-            mock_logger.debug.assert_called_with("Added GitHub token authentication to repository URL")
+            assert creds == ('x-access-token', 'github-token')
 
-    def test_add_authentication_existing_auth_not_overridden(self):
-        """Test that existing authentication in URL is not overridden."""
+    def test_write_credential_store_creates_file(self):
+        """Test that credential store file is created with correct content."""
         mock_logger = Mock()
 
         with patch.dict(os.environ, {
-            'CODECOMMIT_USERNAME': 'new-user',
-            'CODECOMMIT_PASSWORD': 'new-pass'
+            'CODECOMMIT_USERNAME': 'test-user',
+            'CODECOMMIT_PASSWORD': 'test/pass='
         }):
             manager = GitRepositoryManager(mock_logger)
-            url = "https://existing-user:existing-pass@git-codecommit.us-east-1.amazonaws.com/v1/repos/test-repo"
+            url = "https://git-codecommit.us-east-1.amazonaws.com/v1/repos/test-repo"
 
-            auth_url = manager._add_authentication(url)
+            cred_path = manager._write_credential_store(url)
 
-            assert auth_url == url
-            mock_logger.debug.assert_called_with("Authentication already present in URL, not overriding")
+            try:
+                assert cred_path is not None
+                assert os.path.exists(cred_path)
+                # Credential file should be owner-readable only
+                mode = oct(os.stat(cred_path).st_mode)[-3:]
+                assert mode == '600'
+                # File content should have URL-encoded credentials
+                with open(cred_path) as f:
+                    content = f.read()
+                assert 'test-user' in content
+                assert 'test%2Fpass%3D' in content  # URL-encoded
+                assert 'git-codecommit.us-east-1.amazonaws.com' in content
+            finally:
+                if cred_path and os.path.exists(cred_path):
+                    os.remove(cred_path)
 
-    def test_add_authentication_non_http_urls_unchanged(self):
-        """Test that non-HTTP URLs are not modified."""
+    def test_write_credential_store_returns_none_without_creds(self):
+        """Test that None is returned when no credentials are available."""
+        mock_logger = Mock()
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = GitRepositoryManager(mock_logger)
+            url = "https://git-codecommit.us-east-1.amazonaws.com/v1/repos/test-repo"
+
+            cred_path = manager._write_credential_store(url)
+
+            assert cred_path is None
+
+    def test_cleanup_credential_store_removes_file(self):
+        """Test that credential store file is cleaned up."""
         mock_logger = Mock()
 
         with patch.dict(os.environ, {
@@ -130,19 +152,21 @@ class TestCodeCommitAuthentication:
             'CODECOMMIT_PASSWORD': 'test-pass'
         }):
             manager = GitRepositoryManager(mock_logger)
-            url = "/local/path/to/repo"
+            url = "https://git-codecommit.us-east-1.amazonaws.com/v1/repos/test-repo"
 
-            auth_url = manager._add_authentication(url)
+            cred_path = manager._write_credential_store(url)
+            assert os.path.exists(cred_path)
 
-            assert auth_url == url
+            manager._cleanup_credential_store(cred_path)
+            assert not os.path.exists(cred_path)
 
 
 class TestCodeCommitPushAuthentication:
-    """Tests for CodeCommit push authentication in push_with_authentication."""
+    """Tests for CodeCommit push authentication using credential helper."""
 
     @patch('subprocess.run')
     def test_push_with_codecommit_credentials(self, mock_run):
-        """Test that push updates remote URL with CodeCommit credentials."""
+        """Test that push uses credential helper (not embedded creds in URL)."""
         mock_logger = Mock()
 
         with patch.dict(os.environ, {
@@ -156,21 +180,32 @@ class TestCodeCommitPushAuthentication:
             get_url_result.returncode = 0
             get_url_result.stdout = "https://git-codecommit.us-east-1.amazonaws.com/v1/repos/test-repo\n"
 
+            # Mock credential helper config
+            config_result = Mock()
+            config_result.returncode = 0
+
             # Mock push response
             push_result = Mock()
             push_result.returncode = 0
             push_result.stdout = "Success"
             push_result.stderr = ""
 
-            mock_run.side_effect = [get_url_result, Mock(), push_result]
+            # Mock unset config for cleanup
+            unset_result = Mock()
+            unset_result.returncode = 0
+
+            mock_run.side_effect = [get_url_result, config_result, push_result, unset_result]
 
             result = manager.push_with_authentication("/fake/repo", "main")
 
             assert result['status'] == 'success'
-            # Verify remote URL was updated with credentials
-            assert any(
-                call[0][0] == ["git", "remote", "set-url", "origin",
-                               "https://test-user:test-pass@git-codecommit.us-east-1.amazonaws.com/v1/repos/test-repo"]
+            # Verify credential helper was configured (not URL embedding)
+            config_call = mock_run.call_args_list[1]
+            assert 'credential.helper' in str(config_call)
+            assert 'store' in str(config_call)
+            # Verify no set-url call with embedded creds
+            assert not any(
+                'set-url' in str(call) and '@' in str(call)
                 for call in mock_run.call_args_list
             )
 
@@ -184,11 +219,9 @@ class TestCodeCommitRepositoryListing:
         mock_logger = Mock()
         manager = GitRepositoryManager(mock_logger)
 
-        # Mock CodeCommit client
         mock_cc_client = Mock()
         mock_boto_client.return_value = mock_cc_client
 
-        # Mock list_repositories response
         mock_cc_client.list_repositories.return_value = {
             'repositories': [
                 {'repositoryName': 'repo1'},
@@ -196,7 +229,6 @@ class TestCodeCommitRepositoryListing:
             ]
         }
 
-        # Mock get_repository responses
         def mock_get_repo(repositoryName):
             repos = {
                 'repo1': {
@@ -222,16 +254,13 @@ class TestCodeCommitRepositoryListing:
 
         mock_cc_client.get_repository.side_effect = mock_get_repo
 
-        # Call the method
         result = manager.list_codecommit_repositories(region='us-east-1')
 
-        # Verify results
         assert result['status'] == 'success'
         assert result['count'] == 2
         assert result['region'] == 'us-east-1'
         assert len(result['repositories']) == 2
 
-        # Verify repository details
         repo1 = result['repositories'][0]
         assert repo1['name'] == 'repo1'
         assert repo1['clone_url_http'] == 'https://git-codecommit.us-east-1.amazonaws.com/v1/repos/repo1'
@@ -304,7 +333,6 @@ class TestCodeCommitRepositoryListing:
 
         result = manager.list_codecommit_repositories()
 
-        # Should still return success but with basic info
         assert result['status'] == 'success'
         assert result['count'] == 1
         repo = result['repositories'][0]
@@ -340,14 +368,12 @@ class TestCodeCommitRepositoryListing:
 
         result = manager.list_codecommit_repositories()
 
-        # Verify result structure
         assert 'status' in result
         assert 'region' in result
         assert 'count' in result
         assert 'repositories' in result
         assert isinstance(result['repositories'], list)
 
-        # Verify repository structure
         repo = result['repositories'][0]
         assert 'name' in repo
         assert 'clone_url_http' in repo
@@ -397,3 +423,47 @@ class TestCodeCommitInitialization:
             assert manager.codecommit_password == 'cc-pass'
             assert any('GitHub token found' in str(call) for call in mock_logger.debug.call_args_list)
             assert any('CodeCommit credentials found' in str(call) for call in mock_logger.debug.call_args_list)
+
+
+class TestSanitizeErrorMessage:
+    """Tests for universal error message sanitization."""
+
+    def test_sanitize_removes_codecommit_password(self):
+        """Test that CodeCommit passwords are removed from error messages."""
+        mock_logger = Mock()
+
+        with patch.dict(os.environ, {
+            'CODECOMMIT_USERNAME': 'test-user',
+            'CODECOMMIT_PASSWORD': 'secret/pass='
+        }):
+            manager = GitRepositoryManager(mock_logger)
+            msg = "Failed: https://test-user:secret/pass=@git-codecommit.us-east-1.amazonaws.com"
+            sanitized = manager._sanitize_error_message(msg)
+
+            assert 'secret/pass=' not in sanitized
+            assert '***' in sanitized
+
+    def test_sanitize_removes_github_token(self):
+        """Test that GitHub tokens are removed from error messages."""
+        mock_logger = Mock()
+
+        with patch.dict(os.environ, {
+            'GITHUB_TOKEN': 'ghp_abc123secret'
+        }):
+            manager = GitRepositoryManager(mock_logger)
+            msg = "Auth failed with token ghp_abc123secret"
+            sanitized = manager._sanitize_error_message(msg)
+
+            assert 'ghp_abc123secret' not in sanitized
+            assert '***' in sanitized
+
+    def test_sanitize_handles_no_secrets(self):
+        """Test that messages without secrets are returned unchanged."""
+        mock_logger = Mock()
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = GitRepositoryManager(mock_logger)
+            msg = "Regular error message"
+            sanitized = manager._sanitize_error_message(msg)
+
+            assert sanitized == msg
