@@ -172,28 +172,37 @@ async def _update_repos_from_codecommit() -> dict:
             }
 
         existing_repos = repos_data.get("repositories", {})
-        new_repos_added = 0
-        skipped_existing = 0
 
-        # Add CodeCommit repositories to repos.json
+        # Build fresh repo map from CodeCommit — replaces hardcoded/stale
+        # entries that don't belong. Preserves type/description from existing
+        # entries if the repo name matches (user customizations).
+        fresh_repos = {}
+        new_repos_added = 0
+        updated_existing = 0
+
         for repo in codecommit_repos:
             repo_name = repo['name']
 
-            # Skip if already exists
-            if repo_name in existing_repos:
-                skipped_existing += 1
-                continue
+            if repo_name in existing_repos and isinstance(existing_repos[repo_name], dict):
+                # Preserve user customizations (type, description) but update URL
+                entry = existing_repos[repo_name].copy()
+                entry["url"] = repo['clone_url_http']
+                fresh_repos[repo_name] = entry
+                updated_existing += 1
+            else:
+                # New repository
+                fresh_repos[repo_name] = {
+                    "url": repo['clone_url_http'],
+                    "description": repo.get('description', 'CodeCommit repository'),
+                    "type": "generic"
+                }
+                new_repos_added += 1
 
-            # Add new repository
-            existing_repos[repo_name] = {
-                "url": repo['clone_url_http'],
-                "description": repo.get('description', 'CodeCommit repository'),
-                "type": "generic"  # Default type for CodeCommit repos
-            }
-            new_repos_added += 1
+        removed_count = len([k for k, v in existing_repos.items()
+                            if isinstance(v, dict) and k not in fresh_repos])
 
-        # Update repos.json
-        repos_data['repositories'] = existing_repos
+        # Replace entire repositories section with CodeCommit repos only
+        repos_data['repositories'] = fresh_repos
 
         # Write back to file
         with open(repos_file, 'w') as f:
@@ -205,13 +214,15 @@ async def _update_repos_from_codecommit() -> dict:
             "region": result['region'],
             "total_codecommit_repos": len(codecommit_repos),
             "new_repos_added": new_repos_added,
-            "skipped_existing": skipped_existing,
-            "total_repos_in_json": len(existing_repos)
+            "updated_existing": updated_existing,
+            "removed_stale": removed_count,
+            "total_repos_in_json": len(fresh_repos)
         }
 
         activity.logger.info(
-            f"CodeCommit sync completed: {new_repos_added} new repos added, "
-            f"{skipped_existing} already existed, total: {len(existing_repos)}"
+            f"CodeCommit sync completed: {new_repos_added} new, "
+            f"{updated_existing} updated, {removed_count} removed, "
+            f"total: {len(fresh_repos)}"
         )
 
         return summary
